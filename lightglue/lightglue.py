@@ -25,6 +25,7 @@ torch.backends.cudnn.deterministic = True
 def normalize_keypoints(
     kpts: torch.Tensor, size: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    print("Normalizing keypoints")
     if size is None:
         size = 1 + kpts.max(-2).values - kpts.min(-2).values
     elif not isinstance(size, torch.Tensor):
@@ -104,6 +105,7 @@ class Attention(nn.Module):
             torch.backends.cuda.enable_flash_sdp(allow_flash)
 
     def forward(self, q, k, v, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
         if q.shape[-2] == 0 or k.shape[-2] == 0:
             return q.new_zeros((*q.shape[:-1], v.shape[-1]))
         if self.enable_flash and q.device.type == "cuda":
@@ -114,8 +116,11 @@ class Attention(nn.Module):
                 return v if mask is None else v.nan_to_num()
             else:
                 assert mask is None
-                q, k, v = [x.transpose(-2, -3).contiguous() for x in [q, k, v]]
+                # q, k, v = [x.transpose(-2, -3).contiguous() for x in [q, k, v]]
+                
                 m = self.flash_(q.half(), torch.stack([k, v], 2).half())
+                print("attention shape:", m.shape)
+
                 return m.transpose(-2, -3).to(q.dtype).clone()
         elif self.has_sdp:
             args = [x.contiguous() for x in [q, k, v]]
@@ -156,11 +161,13 @@ class SelfBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qkv = self.Wqkv(x)
+        print("qkv shape:", qkv.unflatten(-1, (self.num_heads, -1, 3)).shape)
         qkv = qkv.unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
         q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
         q = apply_cached_rotary_emb(encoding, q)
         k = apply_cached_rotary_emb(encoding, k)
         context = self.inner_attn(q, k, v, mask=mask)
+        print("context shape:", context.shape)
         message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
         return x + self.ffn(torch.cat([x, message], -1))
 
@@ -211,6 +218,7 @@ class CrossBlock(nn.Module):
             if mask is not None:
                 sim = sim.masked_fill(~mask, -float("inf"))
             attn01 = F.softmax(sim, dim=-1)
+            print("sim   shape:", sim.shape)
             attn10 = F.softmax(sim.transpose(-2, -1).contiguous(), dim=-1)
             m0 = torch.einsum("bhij, bhjd -> bhid", attn01, v1)
             m1 = torch.einsum("bhji, bhjd -> bhid", attn10.transpose(-2, -1), v0)
@@ -238,6 +246,7 @@ class TransformerLayer(nn.Module):
         mask0: Optional[torch.Tensor] = None,
         mask1: Optional[torch.Tensor] = None,
     ):
+        print("Forwarding transformer layer")
         if mask0 is not None and mask1 is not None:
             return self.masked_forward(desc0, desc1, encoding0, encoding1, mask0, mask1)
         else:
@@ -260,6 +269,7 @@ def sigmoid_log_double_softmax(
 ) -> torch.Tensor:
     """create the log assignment matrix from logits and similarity"""
     b, m, n = sim.shape
+    print("sigmoid_log_double_softmax shape:", sim.shape, F.logsigmoid(z1).shape, F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).shape)
     certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
     scores0 = F.log_softmax(sim, 2)
     scores1 = F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
@@ -477,6 +487,9 @@ class LightGlue(nn.Module):
         for key in self.required_data_keys:
             assert key in data, f"Missing key {key} in data"
         data0, data1 = data["image0"], data["image1"]
+        for k in data0:
+            print(f"{k}: {data0[k].shape}")
+
         kpts0, kpts1 = data0["keypoints"], data1["keypoints"]
         b, m, _ = kpts0.shape
         b, n, _ = kpts1.shape
