@@ -47,9 +47,19 @@ def pad_to_length(x: torch.Tensor, length: int) -> Tuple[torch.Tensor]:
     mask[..., : x.shape[-2], :] = True
     return y, mask
 
+def swap_last_two(x: torch.Tensor) -> torch.Tensor:
+    dims = list(range(x.dim()))
+    i, j = x.dim() - 2, x.dim() - 3
+    dims[i], dims[j] = dims[j], dims[i]
+    return x.permute(*dims).contiguous()
+
+
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x = x.unflatten(-1, (-1, 2))
+    # x = x.unflatten(-1, (-1, 2))
+    *prefix, T = x.shape
+    L = T // 2
+    x = x.reshape(*prefix, L, 2)  
     x1, x2 = x.unbind(dim=-1)
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
@@ -70,7 +80,8 @@ class LearnableFourierPositionalEncoding(nn.Module):
         """encode position vector"""
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
-        emb = torch.stack([cosines, sines], 0).unsqueeze(-3)
+        # emb = torch.stack([cosines, sines], 0).unsqueeze(-3)
+        emb = torch.stack([cosines, sines], 0).unsqueeze(1)
         return emb.repeat_interleave(2, dim=-1)
 
 
@@ -81,10 +92,16 @@ class TokenConfidence(nn.Module):
 
     def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
         """get confidence tokens"""
-        return (
-            self.token(desc0.detach()).squeeze(-1),
-            self.token(desc1.detach()).squeeze(-1),
-        )
+        # return (
+        #     self.token(desc0.detach()).squeeze(-1),
+        #     self.token(desc1.detach()).squeeze(-1),
+        # )
+        out0 = self.token(desc0.detach())  # [B, M, 1]
+        out1 = self.token(desc1.detach())  # [B, N, 1]
+        B0, M, _ = out0.shape
+        B1, N, _ = out1.shape
+        return out0.reshape(B0, M), out1.reshape(B1, N)
+
 
 
 class Attention(nn.Module):
@@ -104,6 +121,7 @@ class Attention(nn.Module):
             torch.backends.cuda.enable_flash_sdp(allow_flash)
 
     def forward(self, q, k, v, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
         if q.shape[-2] == 0 or k.shape[-2] == 0:
             return q.new_zeros((*q.shape[:-1], v.shape[-1]))
         if self.enable_flash and q.device.type == "cuda":
@@ -114,9 +132,11 @@ class Attention(nn.Module):
                 return v if mask is None else v.nan_to_num()
             else:
                 assert mask is None
-                q, k, v = [x.transpose(-2, -3).contiguous() for x in [q, k, v]]
+                # q, k, v = [x.transpose(-2, -3).contiguous() for x in [q, k, v]]
+                q, k, v = [swap_last_two(x) for x in (q, k, v)]
                 m = self.flash_(q.half(), torch.stack([k, v], 2).half())
-                return m.transpose(-2, -3).to(q.dtype).clone()
+
+                return swap_last_two(m).to(q.dtype).clone()
         elif self.has_sdp:
             args = [x.contiguous() for x in [q, k, v]]
             v = F.scaled_dot_product_attention(*args, attn_mask=mask)
@@ -126,7 +146,9 @@ class Attention(nn.Module):
             sim = torch.einsum("...id,...jd->...ij", q, k) * s
             if mask is not None:
                 sim.masked_fill(~mask, -float("inf"))
-            attn = F.softmax(sim, -1)
+            # attn = F.softmax(sim, -1)
+            last_dim = sim.dim() - 1
+            attn = F.softmax(sim, dim=last_dim)
             return torch.einsum("...ij,...jd->...id", attn, v)
 
 
@@ -156,10 +178,14 @@ class SelfBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qkv = self.Wqkv(x)
-        qkv = qkv.unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
-        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
-        print("q shape:", q.shape, "k shape:", k.shape, "encoding:", encoding.shape)
+        # qkv = qkv.unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
+        B, M, total = qkv.shape
+        H = self.num_heads
+        D = total // (3 * H)
+        qkv = qkv.reshape(-1, M, H, D, 3)  # [B, M, H, D, 3]
+        qkv = qkv.permute(0, 2, 1, 3, 4).contiguous() # [B, H, M, D, 3]
 
+        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
         q = apply_cached_rotary_emb(encoding, q)
         k = apply_cached_rotary_emb(encoding, k)
         context = self.inner_attn(q, k, v, mask=mask)
@@ -198,24 +224,52 @@ class CrossBlock(nn.Module):
     ) -> List[torch.Tensor]:
         qk0, qk1 = self.map_(self.to_qk, x0, x1)
         v0, v1 = self.map_(self.to_v, x0, x1)
-        qk0, qk1, v0, v1 = map(
-            lambda t: t.unflatten(-1, (self.heads, -1)).transpose(1, 2),
-            (qk0, qk1, v0, v1),
-        )
+        # qk0, qk1, v0, v1 = map(
+        #     lambda t: t.unflatten(-1, (self.heads, -1)).transpose(1, 2),
+        #     (qk0, qk1, v0, v1),
+        # )
+        def split_heads(t: torch.Tensor):
+            B, L, HD = t.shape
+            H = self.heads
+            D = HD // H
+            t = t.reshape(B, L, H, D)
+            return t.permute(0, 2, 1, 3).contiguous()
+                
+        qk0 = split_heads(qk0)
+        qk1 = split_heads(qk1)
+        v0  = split_heads(v0)
+        v1  = split_heads(v1)
+
         if self.flash is not None and qk0.device.type == "cuda":
             m0 = self.flash(qk0, qk1, v1, mask)
+            # m1 = self.flash(
+            #     qk1, qk0, v0, mask.transpose(-1, -2) if mask is not None else None
+            # )
             m1 = self.flash(
-                qk1, qk0, v0, mask.transpose(-1, -2) if mask is not None else None
+                qk1,
+                qk0,
+                v0,
+                swap_last_two(mask) if mask is not None else None
             )
         else:
             qk0, qk1 = qk0 * self.scale**0.5, qk1 * self.scale**0.5
             sim = torch.einsum("bhid, bhjd -> bhij", qk0, qk1)
             if mask is not None:
                 sim = sim.masked_fill(~mask, -float("inf"))
-            attn01 = F.softmax(sim, dim=-1)
-            attn10 = F.softmax(sim.transpose(-2, -1).contiguous(), dim=-1)
+            # attn01 = F.softmax(sim, dim=-1)
+            # attn10 = F.softmax(swap_last_two(sim), dim=-1)
+            last_dim = sim.dim() - 1
+            attn01 = F.softmax(sim, dim=last_dim)
+            sim_swapped = swap_last_two(sim)
+            last_dim_swapped = sim_swapped.dim() - 1
+            attn10 = F.softmax(sim_swapped, dim=last_dim_swapped)
+
             m0 = torch.einsum("bhij, bhjd -> bhid", attn01, v1)
-            m1 = torch.einsum("bhji, bhjd -> bhid", attn10.transpose(-2, -1), v0)
+            m1 = torch.einsum(
+                "bhji, bhjd -> bhid",
+                swap_last_two(attn10),
+                v0
+            )
             if mask is not None:
                 m0, m1 = m0.nan_to_num(), m1.nan_to_num()
         m0, m1 = self.map_(lambda t: t.transpose(1, 2).flatten(start_dim=-2), m0, m1)
@@ -261,14 +315,29 @@ def sigmoid_log_double_softmax(
     sim: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
 ) -> torch.Tensor:
     """create the log assignment matrix from logits and similarity"""
-    b, m, n = sim.shape
+    b, m, n = sim.shape    
+    # certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
     certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
     scores0 = F.log_softmax(sim, 2)
-    scores1 = F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
+    # scores1 = F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
+    scores1 = swap_last_two(
+        F.log_softmax(
+            swap_last_two(sim).contiguous(),
+            dim=2
+        )
+    )
     scores = sim.new_full((b, m + 1, n + 1), 0)
     scores[:, :m, :n] = scores0 + scores1 + certainties
-    scores[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
-    scores[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
+    # scores[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
+    # scores[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
+    ls0 = F.logsigmoid(-z0)         # [B, M, 1]
+    B, M, _ = ls0.shape
+    scores[:, :-1, -1] = ls0.reshape(B, M)   # [B, M]
+
+    ls1 = F.logsigmoid(-z1)         # [B, N, 1]
+    B, N, _ = ls1.shape
+    scores[:, -1, :-1] = ls1.reshape(B, N)   # [B, N]
+
     return scores
 
 
@@ -281,7 +350,6 @@ class MatchAssignment(nn.Module):
 
     def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
         """build assignment matrix from descriptors"""
-        print("!!desc0 shape:", desc0.shape, "desc1 shape:", desc1.shape)
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         _, _, d = mdesc0.shape
         mdesc0, mdesc1 = mdesc0 / d**0.25, mdesc1 / d**0.25
@@ -292,7 +360,10 @@ class MatchAssignment(nn.Module):
         return scores, sim
 
     def get_matchability(self, desc: torch.Tensor):
-        return torch.sigmoid(self.matchability(desc)).squeeze(-1)
+        out = torch.sigmoid(self.matchability(desc))
+        B, M, _ = out.shape
+        return out.reshape(B, M) 
+        # return torch.sigmoid(self.matchability(desc)).squeeze(-1)
 
 
 def filter_matches(scores: torch.Tensor, th: float):
@@ -488,13 +559,13 @@ class LightGlue(nn.Module):
         kpts0 = normalize_keypoints(kpts0, size0).clone()
         kpts1 = normalize_keypoints(kpts1, size1).clone()
 
-        if self.conf.add_scale_ori:
-            kpts0 = torch.cat(
-                [kpts0] + [data0[k].unsqueeze(-1) for k in ("scales", "oris")], -1
-            )
-            kpts1 = torch.cat(
-                [kpts1] + [data1[k].unsqueeze(-1) for k in ("scales", "oris")], -1
-            )
+        # if self.conf.add_scale_ori:
+        #     kpts0 = torch.cat(
+        #         [kpts0] + [data0[k].unsqueeze(-1) for k in ("scales", "oris")], -1
+        #     )
+        #     kpts1 = torch.cat(
+        #         [kpts1] + [data1[k].unsqueeze(-1) for k in ("scales", "oris")], -1
+        #     )
         desc0 = data0["descriptors"].detach().contiguous()
         desc1 = data1["descriptors"].detach().contiguous()
 
@@ -582,7 +653,6 @@ class LightGlue(nn.Module):
                 "prune0": prune0,
                 "prune1": prune1,
             }
-        print("desc0 shape:", desc0.shape, "desc1 shape:", desc1.shape)
 
         desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]  # remove padding
         scores, _ = self.log_assignment[i](desc0, desc1)
@@ -612,7 +682,6 @@ class LightGlue(nn.Module):
         else:
             prune0 = torch.ones_like(mscores0) * self.conf.n_layers
             prune1 = torch.ones_like(mscores1) * self.conf.n_layers
-
         return {
             "matches0": m0,
             "matches1": m1,
@@ -636,7 +705,9 @@ class LightGlue(nn.Module):
         """mask points which should be removed"""
         keep = scores > (1 - self.conf.width_confidence)
         if confidences is not None:  # Low-confidence points are never pruned.
-            keep |= confidences <= self.confidence_thresholds[layer_index]
+            # keep |= confidences <= self.confidence_thresholds[layer_index]
+            low_conf_mask = confidences <= self.confidence_thresholds[layer_index]
+            keep = torch.logical_or(keep, low_conf_mask)
         return keep
 
     def check_if_stop(
