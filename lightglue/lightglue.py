@@ -158,7 +158,6 @@ class SelfBlock(nn.Module):
         qkv = self.Wqkv(x)
         qkv = qkv.unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
         q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
-        print("q shape:", q.shape, "k shape:", k.shape, "encoding:", encoding.shape)
 
         q = apply_cached_rotary_emb(encoding, q)
         k = apply_cached_rotary_emb(encoding, k)
@@ -281,7 +280,6 @@ class MatchAssignment(nn.Module):
 
     def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
         """build assignment matrix from descriptors"""
-        print("!!desc0 shape:", desc0.shape, "desc1 shape:", desc1.shape)
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         _, _, d = mdesc0.shape
         mdesc0, mdesc1 = mdesc0 / d**0.25, mdesc1 / d**0.25
@@ -582,7 +580,6 @@ class LightGlue(nn.Module):
                 "prune0": prune0,
                 "prune1": prune1,
             }
-        print("desc0 shape:", desc0.shape, "desc1 shape:", desc1.shape)
 
         desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]  # remove padding
         scores, _ = self.log_assignment[i](desc0, desc1)
